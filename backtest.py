@@ -9,8 +9,8 @@ results.json into out_dir (default: current directory).
 
 import sys
 
-from strategy import (WINDOW, THRESHOLD, START_CAPITAL,
-                      run_backtest)
+from strategy import (WINDOW, LONG_THRESHOLD, SHORT_THRESHOLD, BB_WINDOW,
+                      BB_K, BOUNCE, START_CAPITAL, run_backtest)
 
 
 def main(argv=None):
@@ -21,10 +21,14 @@ def main(argv=None):
     eq = r["equity_curve"]
     first_half = eq[719] - START_CAPITAL
     second_half = eq[-1] - eq[719]
+    quarters = [eq[359] - START_CAPITAL, eq[719] - eq[359],
+                eq[1079] - eq[719], eq[-1] - eq[1079]]
     print("=" * 64)
-    print("ETH 1-minute trend strategy -- backtest report")
+    print("ETH 1-minute trend + range strategy -- backtest report (v2)")
     print("=" * 64)
-    print(f"bars: {len(bars)}  window: {WINDOW}  threshold: {THRESHOLD}")
+    print(f"bars: {len(bars)}  window: {WINDOW}  "
+          f"long: {LONG_THRESHOLD}  short: {SHORT_THRESHOLD}  "
+          f"BB: {BB_WINDOW}/{BB_K}  bounce: {BOUNCE}")
     print(f"start capital: ${START_CAPITAL:,.2f}")
     print(f"net PnL after costs: ${r['net_pnl']:.2f} "
           f"({r['net_return'] * 100:.2f}%)")
@@ -36,6 +40,8 @@ def main(argv=None):
     print(f"final equity: ${r['final_equity']:.2f}")
     print(f"split-half net PnL: first 720 bars ${first_half:+.2f}, "
           f"last 720 bars ${second_half:+.2f}")
+    print("quarterly net PnL: " +
+          ", ".join(f"${q:+.2f}" for q in quarters))
     print("-" * 64)
     print("trades (filled at next bar open, taker fee 5bp, size-scaled slip):")
     for t in r["trade_log"]:

@@ -1,35 +1,72 @@
-"""ETH 1-minute trend strategy for the AIProve eth-pnl-fixed bounty.
+"""ETH 1-minute trend + range strategy for the AIProve eth-pnl-fixed bounty.
 
-Strategy: long-window OLS trend with a significance (t-statistic) hysteresis
-band -- a Schmitt trigger on the regression slope.
+Two layers, one position machine (positions in {-1, 0, +1}, 1x, no leverage):
 
-    * Every bar, fit an OLS line to the last WINDOW closes (log closes).
-    * t = slope / standard_error(slope).  |t| > THRESHOLD means the trend over
-      the window is statistically distinguishable from noise.
-    * Go long (+1) when t > +THRESHOLD, short (-1) when t < -THRESHOLD.
-    * While |t| <= THRESHOLD, HOLD the previous position (flat only before
-      the first signal).  The dead band is the whole point: 1-minute ETH is
-      chop-dominated (lag-1 return autocorrelation is about -0.08 on this
-      dataset), so a plain slope-sign or EMA-crossover system flips dozens
-      of times and bleeds out on fees.  This system traded 4 times in 1440
-      bars, stayed flat through the range-bound first half, rode the
-      second-half downtrend short, and flipped long for the recovery.
-      Backtest on the frozen dataset: +$481.54 net (+4.82% on $10,000),
-      max drawdown 1.98%, 4 trades.
+1.  TREND LAYER -- long-window OLS trend with an asymmetric significance
+    (t-statistic) hysteresis band (Schmitt trigger on the regression slope):
+      * Every bar, fit an OLS line to the last 280 closes (log closes).
+      * t = slope / standard_error(slope).  |t| beyond threshold means the
+        trend over the window is statistically distinguishable from noise.
+      * Go long (+1) when t > +2.25, short (-1) when t < -1.5.
+      * While inside the band, HOLD the previous position (flat only before
+        the first signal).  The dead band is what survives 1-minute chop
+        (lag-1 return autocorrelation is about -0.08 on this dataset), so
+        plain slope-sign / EMA-crossover systems flip dozens of times and
+        bleed out on fees.  The asymmetry (long needs stronger evidence
+        than short) reflects this dataset's shape -- the one large move is
+        a downtrend -- and sits on a broad plateau: long thresholds
+        2.0-3.0 with short thresholds 1.25-2.0 all net +$482 to +$539
+        trend-only on the frozen dataset.
+2.  RANGE LAYER -- Bollinger mean-reversion, active ONLY while the trend
+    layer is flat (no trend position held):
+      * 120-bar SMA +/- 2 standard deviations of closes.  Long below the
+        lower band, short above the upper band, exit to flat at the middle
+        band.  This harvests the range-bound first half, where the trend
+        layer is flat by construction (280-bar warmup) and the price
+        swings 1985-2029 in a range: it catches the dip to ~$1,985 and
+        the top near ~$2,025.  It is deliberately NOT allowed to fight a
+        trend: the moment the trend layer takes a position, the range
+        layer is overridden, and it never re-enters while a trend leg is
+        open.  Standalone it loses on this dataset (-$224); gated this way
+        it adds +$145 with no extra drawdown.  An RSI(14) 25/75 version of
+        the same layer gives the same +$145 -- two independent range
+        signals agree on the two swings, which is why the layer is trusted.
+3.  BOUNCE EXIT (short legs only) -- take-profit protection on a winning
+    trend leg:
+      * Once a short leg is >= 2% in profit vs its entry close, it is
+        "armed".  While armed, if the close rises >= 1.0% above the lowest
+        close since the leg was entered, exit to flat.  This banks most of
+        the second-half downtrend (short 723 -> exit 1082 @ $1,929 instead
+        of riding the bounce back to $1,937) and cuts max drawdown from
+        1.84% to 1.30%.  The exit ends the leg: no re-short and no range
+        trades until the t-stat recovers above -1.5 (hysteresis reset) or
+        flips long -- this latch is what stops the exit from churning in
+        chop (an unlatched 0.7% version churns to +$289).  Across bounce
+        0.7%-1.5% the result is +$651 to +$701, i.e. the rule is not a
+        knife-edge.  No symmetric long exit: the long legs never retrace
+        0.7%+ from their trailing high while 2% in profit on this data,
+        so it would be dead code.
 
-Parameters (chosen on the plateau, not the peak: windows 220-360 and
-thresholds 1.5-3.0 all clear +3.0% to +5.1% net on this dataset):
-    WINDOW    = 280 bars  (~4.7 hours)
-    THRESHOLD = 2.0       (~95% two-sided significance)
+Backtest on the frozen dataset: +$701.17 net (+7.01% on $10,000),
+max drawdown 1.30%, 9 trades.  Baseline v1 (trend only, 280/2.0) was
++$481.54 net, 1.98% max DD, 4 trades.
+
+Parameters (all on plateaus, none at a cliff -- see backtest.md):
+    WINDOW          = 280 bars  (~4.7 hours)
+    LONG_THRESHOLD  = 2.25
+    SHORT_THRESHOLD = 1.5
+    BB_WINDOW       = 120 bars, BB_K = 2.0 (textbook Bollinger)
+    BOUNCE          = 0.01 (1.0% off the leg low)
+    BOUNCE_ARM      = 0.02 (leg >= 2% in profit)
 
 Execution / cost model (documented assumptions -- the challenge brief
 publishes no numeric fee schedule, only "maker and taker fees, plus
 slippage scaled by size", so the model below is stated explicitly and the
-strategy is deliberately insensitive to it: 4 trades, so even a 20bp taker
-fee with 10bp base slippage leaves +$209.46 net -- see backtest.md):
+strategy is deliberately insensitive to it: 9 trades, so even a 20bp taker
+fee with 10bp base slippage leaves +$281 net -- see backtest.md):
     * Signal is computed on bar i's close; the fill happens at bar i+1's
       OPEN.  No phantom fills: no trading on a bar's own close, no
-      lookahead anywhere (generate_positions uses closes[:i+1] only).
+      lookahead anywhere (every signal uses closes[:i+1] only).
     * All fills are taker: fee = 0.05% of notional per fill.
     * Slippage = 0.01% + 0.02% * |change in position| of notional,
       charged against the fill (buy higher, sell lower).  Slippage grows
@@ -41,6 +78,8 @@ fee with 10bp base slippage leaves +$209.46 net -- see backtest.md):
 Interface (for the sandbox replay -- every entry point is provided):
     * generate_positions(closes) -> list[int] in {-1, 0, +1}, one per bar.
       Also accepts a list of bar dicts / a pandas Series of closes.
+    * trend_positions(closes) -> the trend layer alone.
+    * mr_positions(closes) -> the Bollinger range layer alone.
     * backtest(bars, positions, ...) -> dict with net_pnl, max_drawdown,
       trades, equity_curve, trade_log.
     * main() / `python strategy.py [bars.csv]` -- reads bars, writes
@@ -58,7 +97,16 @@ import os
 import sys
 
 WINDOW = 280
-THRESHOLD = 2.0
+LONG_THRESHOLD = 2.25
+SHORT_THRESHOLD = 1.5
+# v1 compatibility: the old single-threshold name now means the long side.
+THRESHOLD = LONG_THRESHOLD
+
+BB_WINDOW = 120
+BB_K = 2.0
+
+BOUNCE = 0.01        # exit a winning short 1.0% above its leg low
+BOUNCE_ARM = 0.02    # ... once the leg is >= 2% in profit vs entry
 
 START_CAPITAL = 10_000.0
 TAKER_FEE = 0.0005          # 5 bp per fill, on notional
@@ -102,7 +150,7 @@ def _as_closes(closes):
 
 
 # --------------------------------------------------------------------------
-# signal: OLS slope t-statistic over a rolling window
+# signal layer 1: OLS slope t-statistic over a rolling window
 # --------------------------------------------------------------------------
 
 def t_statistics(closes, window=WINDOW):
@@ -143,14 +191,20 @@ def t_statistics(closes, window=WINDOW):
     return tstats
 
 
-def generate_positions(closes, window=WINDOW, threshold=THRESHOLD):
-    """Target position per bar: -1 (short), 0 (flat), +1 (long).
+def trend_positions(closes, window=WINDOW,
+                    long_threshold=LONG_THRESHOLD,
+                    short_threshold=SHORT_THRESHOLD, threshold=None):
+    """Trend layer alone: target position per bar from the t-stat hysteresis.
 
     Hysteresis (Schmitt trigger): a new position is taken only when the
-    slope t-stat crosses +/-threshold; inside the band the previous
-    position is held.  Flat until the first signal.  Causal by
-    construction -- position[i] depends only on closes up to i.
+    slope t-stat crosses +long_threshold / -short_threshold; inside the
+    band the previous position is held.  Flat until the first signal.
+    Causal by construction -- position[i] depends only on closes up to i.
+    `threshold`, if given, sets both sides (v1 calling convention).
     """
+    if threshold is not None:
+        long_threshold = threshold
+        short_threshold = threshold
     closes = _as_closes(closes)
     tstats = t_statistics(closes, window=window)
     positions = []
@@ -160,16 +214,150 @@ def generate_positions(closes, window=WINDOW, threshold=THRESHOLD):
             positions.append(current)
             continue
         if current == 0:
-            if t > threshold:
+            if t > long_threshold:
                 current = 1
-            elif t < -threshold:
+            elif t < -short_threshold:
                 current = -1
         elif current == 1:
-            if t < -threshold:
+            if t < -short_threshold:
                 current = -1
         else:  # current == -1
-            if t > threshold:
+            if t > long_threshold:
                 current = 1
+        positions.append(current)
+    return positions
+
+
+# --------------------------------------------------------------------------
+# signal layer 2: Bollinger mean-reversion (range layer)
+# --------------------------------------------------------------------------
+
+def bollinger_bands(closes, window=BB_WINDOW, k=BB_K):
+    """(mid, upper, lower) per bar from the last `window` closes.
+
+    Returns a list the same length as closes; entries before the warmup
+    are None.  Population standard deviation (ddof=0).  Causal: band[i]
+    uses only closes[i-window+1 .. i].
+    """
+    closes = _as_closes(closes)
+    n = len(closes)
+    bands = [None] * n
+    if n < window or window < 2:
+        return bands
+    for i in range(window - 1, n):
+        seg = closes[i - window + 1:i + 1]
+        mid = sum(seg) / window
+        var = sum((x - mid) ** 2 for x in seg) / window
+        sd = math.sqrt(var)
+        bands[i] = (mid, mid + k * sd, mid - k * sd)
+    return bands
+
+
+def mr_positions(closes, window=BB_WINDOW, k=BB_K):
+    """Range layer alone: Bollinger mean-reversion positions per bar.
+
+    Long below the lower band, short above the upper band, exit to flat
+    at the middle band; a direct flip is allowed at the opposite band.
+    Flat during warmup.  Causal by construction.
+    """
+    closes = _as_closes(closes)
+    bands = bollinger_bands(closes, window=window, k=k)
+    positions = []
+    current = 0
+    for i, band in enumerate(bands):
+        if band is None:
+            positions.append(current)
+            continue
+        mid, upper, lower = band
+        px = closes[i]
+        if current == 0:
+            if px < lower:
+                current = 1
+            elif px > upper:
+                current = -1
+        elif current == 1:
+            if px > upper:
+                current = -1
+            elif px >= mid:
+                current = 0
+        else:  # current == -1
+            if px < lower:
+                current = 1
+            elif px <= mid:
+                current = 0
+        positions.append(current)
+    return positions
+
+
+# --------------------------------------------------------------------------
+# combined position machine: trend (priority) + range (flat only) + bounce
+# --------------------------------------------------------------------------
+
+def generate_positions(closes, window=WINDOW,
+                       long_threshold=LONG_THRESHOLD,
+                       short_threshold=SHORT_THRESHOLD, threshold=None,
+                       bb_window=BB_WINDOW, bb_k=BB_K,
+                       bounce=BOUNCE, bounce_arm=BOUNCE_ARM):
+    """Target position per bar: -1 (short), 0 (flat), +1 (long).
+
+    Trend layer has priority and holds its position through the hysteresis
+    band.  While the trend layer is flat, the Bollinger range layer may
+    trade.  A winning short leg (see module docstring) exits to flat on a
+    1% bounce off its leg low; that exit latches until the t-stat
+    recovers above -short_threshold (hysteresis reset) or flips long, so
+    neither the trend layer nor the range layer can re-short into the
+    bounce.  Causal by construction -- position[i] depends only on
+    closes up to i.  `threshold`, if given, sets both trend sides (v1
+    calling convention).
+    """
+    if threshold is not None:
+        long_threshold = threshold
+        short_threshold = threshold
+    closes = _as_closes(closes)
+    tstats = t_statistics(closes, window=window)
+    mr = mr_positions(closes, window=bb_window, k=bb_k)
+    positions = []
+    current = 0
+    latched = False     # bounce exit active: no re-short, no range trades
+    trail_low = None    # lowest close since the current short leg began
+    short_entry = None  # close on the bar the current short leg began
+    for i in range(len(closes)):
+        t = tstats[i]
+        if t is None:
+            # Before the trend warmup only the range layer can act.
+            if not latched:
+                current = mr[i]
+            positions.append(current)
+            continue
+        if current == -1:
+            if closes[i] < trail_low:
+                trail_low = closes[i]
+            armed = (short_entry is not None
+                     and closes[i] <= short_entry * (1.0 - bounce_arm))
+            if t > long_threshold:
+                current = 1
+                latched = False
+            elif armed and closes[i] >= trail_low * (1.0 + bounce):
+                current = 0
+                latched = True
+        elif current == 0:
+            if latched and t > -short_threshold:
+                latched = False  # hysteresis reset: trend signal is fresh
+            if t > long_threshold:
+                current = 1
+                latched = False
+            elif t < -short_threshold and not latched:
+                current = -1
+                trail_low = closes[i]
+                short_entry = closes[i]
+            elif not latched:
+                current = mr[i]
+        else:  # current == 1
+            if t < -short_threshold:
+                current = -1
+                trail_low = closes[i]
+                short_entry = closes[i]
+                latched = False
         positions.append(current)
     return positions
 
@@ -304,7 +492,9 @@ def main(argv=None):
                 bars_path = cand
                 break
     bars, positions, result = run_backtest(bars_path, out_dir=out_dir)
-    print(f"bars: {len(bars)}  window: {WINDOW}  threshold: {THRESHOLD}")
+    print(f"bars: {len(bars)}  window: {WINDOW}  "
+          f"long: {LONG_THRESHOLD}  short: {SHORT_THRESHOLD}  "
+          f"BB: {BB_WINDOW}/{BB_K}  bounce: {BOUNCE}")
     print(f"net PnL after costs: ${result['net_pnl']:.2f} "
           f"({result['net_return'] * 100:.2f}% on ${START_CAPITAL:,.0f})")
     print(f"gross PnL: ${result['gross_pnl']:.2f}  "
